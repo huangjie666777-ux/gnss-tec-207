@@ -35,6 +35,18 @@ def ecef_to_geodetic(xyz: np.ndarray) -> tuple[float, float, float]:
     return math.degrees(lat), math.degrees(lon), h
 
 
+def geodetic_to_ecef(lat_deg: float, lon_deg: float, h: float) -> np.ndarray:
+    """(lat deg, lon deg, ellipsoidal height m) -> ECEF (m), WGS84."""
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    n = WGS84_A / math.sqrt(1.0 - WGS84_E2 * math.sin(lat) ** 2)
+    return np.array([
+        (n + h) * math.cos(lat) * math.cos(lon),
+        (n + h) * math.cos(lat) * math.sin(lon),
+        (n * (1.0 - WGS84_E2) + h) * math.sin(lat),
+    ])
+
+
 def epoch_to_seconds(t: dt.datetime) -> float:
     """Seconds since GPS epoch (continuous, week-rollover safe)."""
     return (t - GPS_EPOCH).total_seconds()

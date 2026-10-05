@@ -1,10 +1,13 @@
-"""Generate a synthetic RINEX 3.04 obs file and SP3-c ephemeris for testing.
+"""Generate synthetic RINEX 3.04 obs, SP3-c ephemeris and code biases.
 
 Simulates 8 GPS satellites on circular orbits, a fixed receiver with a clock
-offset, and writes examples/obs.rnx + examples/eph.sp3.
+offset, a smooth slant-TEC ionosphere, per-satellite P1-P2 code biases and
+one LLI-flagged epoch (G03) to demonstrate arc splitting.
+Writes examples/obs.rnx, examples/eph.sp3, examples/biases.json.
 """
 
 import datetime as dt
+import json
 import math
 import os
 
@@ -27,6 +30,20 @@ RX_CLK = 1.5e-4  # seconds
 
 ORB_R = 26560e3
 N_SATS = 8
+F1 = 1575.42e6
+F2 = 1227.60e6
+LAM1 = C / F1
+LAM2 = C / F2
+
+
+def stec_tecu(prn_idx: int, t: float) -> float:
+    """Synthetic slant TEC in TECU (smooth in time, varies per satellite)."""
+    return 15.0 + 8.0 * math.sin(2 * math.pi * t / 3600.0 + prn_idx * 1.3)
+
+
+def dcb_ns(prn_idx: int) -> float:
+    """Synthetic merged P1-P2 code bias in ns."""
+    return 0.5 * (prn_idx + 1)
 
 
 def sat_pos(prn_idx: int, t: float) -> np.ndarray:
@@ -34,7 +51,7 @@ def sat_pos(prn_idx: int, t: float) -> np.ndarray:
     rotated to ECEF at time t)."""
     raan = math.radians(prn_idx * 45.0)
     inc = math.radians(55.0)
-    u0 = math.radians(prn_idx * 37.0)
+    u0 = math.radians(prn_idx * 37.0 + 160.0)  # phase chosen so 4+ sats are visible
     n = 2 * math.pi / 43082.0  # ~half sidereal day
     u = u0 + n * t
     x_o = ORB_R * math.cos(u)
@@ -95,6 +112,11 @@ def main():
     with open(os.path.join(outdir, "eph.sp3"), "w") as f:
         f.write("\n".join(lines) + "\n")
 
+    # --- code biases ---
+    biases = {f"G{s + 1:02d}": dcb_ns(s) for s in range(N_SATS)}
+    with open(os.path.join(outdir, "biases.json"), "w") as f:
+        json.dump(biases, f, indent=2)
+
     # --- RINEX obs ---
     rng = np.random.default_rng(42)
     lines = []
@@ -102,7 +124,8 @@ def main():
     lines.append(f"{'SYNTH':<20}{'TEST':<20}{'20240601 000000 UTC':<20}PGM / RUN BY / DATE")
     lines.append(f"{RX[0]:14.4f}{RX[1]:14.4f}{RX[2]:14.4f}{'':18}APPROX POSITION XYZ")
     lines.append(f"{0:6d}{'':54}RCV CLOCK OFFS APPL")
-    lines.append(f"{'G':<1}{1:5d} {'C1C':<4}{'':49}SYS / # / OBS TYPES")
+    lines.append(f"{'G':<1}{4:5d} {'C1C':<4}{'C2W':<4}{'L1C':<4}{'L2W':<4}"
+                 f"{'':37}SYS / # / OBS TYPES")
     lines.append(f"{t0.year:6d}{t0.month:6d}{t0.day:6d}{t0.hour:6d}{t0.minute:6d}"
                  f"{t0.second:12.7f}GPS{'':9}TIME OF FIRST OBS")
     lines.append(f"{'':60}END OF HEADER")
@@ -125,11 +148,26 @@ def main():
                                 [0, 0, 1]])
                 pr_guess = (np.linalg.norm(rot @ p - RX)
                             + C * RX_CLK - C * sat_clk(s, t_tx))
-            pr = pr_guess + rng.normal(0, 0.3)
-            lines.append(f"G{s + 1:02d}{pr:14.3f}  ")
+            # ionosphere: code delayed, phase advanced, by 40.3*STEC/f^2
+            stec_si = stec_tecu(s, ts) * 1e16
+            i1 = 40.3 * stec_si / F1**2
+            i2 = 40.3 * stec_si / F2**2
+            c1c = pr_guess + i1 + rng.normal(0, 0.3)
+            c2w = pr_guess + i2 + C * dcb_ns(s) * 1e-9 + rng.normal(0, 0.05)
+            n1 = 100000 + s * 137  # constant integer ambiguities (cycles)
+            n2 = 80000 + s * 91
+            l1c = (pr_guess - i1) / LAM1 + n1 + rng.normal(0, 0.002)
+            l2w = (pr_guess - i2) / LAM2 + n2 + rng.normal(0, 0.002)
+            # G03 loses lock on L1 at epoch index 3 -> arc break demo
+            lli1 = 1 if (s == 2 and e == 3) else 0
+            lines.append(f"G{s + 1:02d}"
+                         f"{c1c:14.3f}  "
+                         f"{c2w:14.3f}  "
+                         f"{l1c:14.3f}{lli1} "
+                         f"{l2w:14.3f}  ")
     with open(os.path.join(outdir, "obs.rnx"), "w") as f:
         f.write("\n".join(lines) + "\n")
-    print("wrote examples/obs.rnx and examples/eph.sp3")
+    print("wrote examples/obs.rnx, examples/eph.sp3, examples/biases.json")
 
 
 if __name__ == "__main__":

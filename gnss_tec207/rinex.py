@@ -1,4 +1,9 @@
-"""RINEX 3.04 observation file parser (GPS, C1C, normal epochs only)."""
+"""RINEX 3.04 observation file parser (GPS, normal epochs only).
+
+Parses every declared GPS observation type; each value carries its LLI
+(loss-of-lock indicator). C1C pseudoranges feed positioning; C1C/C2W/L1C/L2W
+feed the dual-frequency TEC pipeline.
+"""
 
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ class EpochObs:
     time: dt.datetime
     # prn -> pseudorange in meters (C1C); missing sats absent
     pseudoranges: dict[str, float] = field(default_factory=dict)
+    # prn -> obs type -> (value, lli); missing values absent
+    obs: dict[str, dict[str, tuple[float, int]]] = field(default_factory=dict)
 
 
 @dataclass
@@ -125,7 +132,6 @@ def parse_rinex(text: str) -> RinexData:
         raise RejectedContentError("no GPS (G) observation types in header", FILE, 0)
     if "C1C" not in obs_types:
         raise RejectedContentError("C1C pseudorange not present in obs types", FILE, 0)
-    c1c_idx = obs_types.index("C1C")
 
     # --- approximate position (initial guess only) ---
     approx = None
@@ -181,14 +187,27 @@ def parse_rinex(text: str) -> RinexData:
             if prn[0] != "G":
                 i += 1
                 continue  # non-GPS satellites ignored per spec
-            need_len = 3 + 16 * (c1c_idx + 1)
+            need_len = 3 + 16 * len(obs_types)
             if len(oline) < need_len:
                 raise RinexParseError(
-                    f"observation line truncated: need {need_len} chars for C1C", FILE, oln)
-            start = 3 + 16 * c1c_idx
-            val = _parse_float_field(oline[start:start + 14], FILE, oln)
-            if val is not None:
-                obs.pseudoranges[prn.strip()] = val
+                    f"observation line truncated: need {need_len} chars for "
+                    f"{len(obs_types)} obs types", FILE, oln)
+            sat_obs: dict[str, tuple[float, int]] = {}
+            for idx, otype in enumerate(obs_types):
+                field_start = 3 + 16 * idx
+                field = oline[field_start:field_start + 16]
+                val = _parse_float_field(field[:14], FILE, oln)
+                if val is None:
+                    continue
+                lli_raw = field[14:15].strip()
+                if lli_raw and lli_raw not in "01234567":
+                    raise RinexParseError(
+                        f"invalid LLI flag {lli_raw!r} for {otype}", FILE, oln)
+                sat_obs[otype] = (val, int(lli_raw) if lli_raw else 0)
+            if sat_obs:
+                obs.obs[prn.strip()] = sat_obs
+                if "C1C" in sat_obs:
+                    obs.pseudoranges[prn.strip()] = sat_obs["C1C"][0]
             i += 1
         epochs.append(obs)
         if len(epochs) > MAX_EPOCHS:
