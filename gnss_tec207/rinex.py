@@ -1,4 +1,10 @@
-"""RINEX 3.04 observation file parser (GPS, C1C, normal epochs only)."""
+"""RINEX 3.04 observation file parser (GPS time, normal epochs only).
+
+The positioning path uses C1C; the ionosphere/TEC path additionally needs
+C2W, L1C, L2W together with their phase LLI indicators. Rejected content
+(event epochs, pre-applied receiver clock, unsupported corrections) always
+raises RejectedContentError with file and line number.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,19 @@ from .errors import RejectedContentError, RinexParseError
 
 FILE = "rinex"
 MAX_EPOCHS = 100
+REQUIRED_TEC_TYPES = ("C1C", "C2W", "L1C", "L2W")
+
+
+@dataclass
+class SignalObs:
+    """All GPS observables for one satellite at one epoch.
+
+    ranges in meters, phases in cycles, lli in raw RINEX bit flags.
+    """
+
+    prn: str
+    values: dict[str, float]
+    lli: dict[str, int]
 
 
 @dataclass
@@ -16,6 +35,9 @@ class EpochObs:
     time: dt.datetime
     # prn -> pseudorange in meters (C1C); missing sats absent
     pseudoranges: dict[str, float] = field(default_factory=dict)
+    # prn -> SignalObs (present whenever the satellite line was observed,
+    # even if individual quantities are missing)
+    signals: dict[str, SignalObs] = field(default_factory=dict)
 
 
 @dataclass
@@ -39,6 +61,27 @@ def _parse_float_field(text: str, file: str, line: int) -> float | None:
     if v == 0.0:
         return None
     return v
+
+
+def _parse_lli_field(text: str, file: str, line: int) -> int:
+    """Parse the LLI single-digit field; blank means 0 (no warning)."""
+    s = text.strip()
+    if not s:
+        return 0
+    try:
+        v = int(s)
+    except ValueError:
+        raise RinexParseError(f"invalid LLI field {s!r}", file, line)
+    if not 0 <= v <= 15:
+        raise RinexParseError(f"LLI field {v} out of range 0-15", file, line)
+    return v
+
+
+def _valid_gps_prn(prn: str) -> bool:
+    """GPS satellite id check: G01..G32 (GPS constellation, RINEX 3)."""
+    if len(prn) != 3 or prn[0] != "G":
+        return False
+    return prn[1:].isdigit() and 1 <= int(prn[1:]) <= 32
 
 
 def _parse_header(lines: list[str]) -> tuple[dict, int]:
@@ -91,6 +134,15 @@ def parse_rinex(text: str) -> RinexData:
             except ValueError:
                 raise RinexParseError("bad RCV CLOCK OFFS APPL value", FILE, vln)
 
+    # --- reject any header correction/scale that would modify raw signals ---
+    for unsupported in ("SYS SCALE / FACTOR", "SYS PHASE SHIFT",
+                        "GLONASS SLOT / FRQ #", "IONOSPHERIC CORR",
+                        "TIME SYSTEM CORR"):
+        if unsupported in header:
+            _, xln = header[unsupported][0]
+            raise RejectedContentError(
+                f"unsupported correction/header record {unsupported!r}", FILE, xln)
+
     # --- observation types (with continuation lines) ---
     sys_obs = header.get("SYS / # / OBS TYPES")
     if not sys_obs:
@@ -123,9 +175,12 @@ def parse_rinex(text: str) -> RinexData:
         break
     if obs_types is None:
         raise RejectedContentError("no GPS (G) observation types in header", FILE, 0)
-    if "C1C" not in obs_types:
-        raise RejectedContentError("C1C pseudorange not present in obs types", FILE, 0)
+    for req in REQUIRED_TEC_TYPES:
+        if req not in obs_types:
+            raise RejectedContentError(
+                f"required GPS observation type {req} not present in obs types", FILE, 0)
     c1c_idx = obs_types.index("C1C")
+    type_idx = {t: idx for idx, t in enumerate(obs_types)}
 
     # --- approximate position (initial guess only) ---
     approx = None
@@ -181,14 +236,28 @@ def parse_rinex(text: str) -> RinexData:
             if prn[0] != "G":
                 i += 1
                 continue  # non-GPS satellites ignored per spec
-            need_len = 3 + 16 * (c1c_idx + 1)
-            if len(oline) < need_len:
+            prn_id = prn.strip()
+            if not _valid_gps_prn(prn_id):
+                raise RejectedContentError(
+                    f"invalid/unsupported GPS satellite id {prn_id!r}", FILE, oln)
+            full_need = 3 + 16 * len(obs_types)
+            if len(oline) < full_need:
                 raise RinexParseError(
-                    f"observation line truncated: need {need_len} chars for C1C", FILE, oln)
-            start = 3 + 16 * c1c_idx
-            val = _parse_float_field(oline[start:start + 14], FILE, oln)
-            if val is not None:
-                obs.pseudoranges[prn.strip()] = val
+                    f"observation line truncated: need {full_need} chars for "
+                    f"{len(obs_types)} obs types", FILE, oln)
+            values: dict[str, float] = {}
+            lli: dict[str, int] = {}
+            for type_name, idx in type_idx.items():
+                start = 3 + 16 * idx
+                val = _parse_float_field(oline[start:start + 14], FILE, oln)
+                if val is not None:
+                    values[type_name] = val
+                lli[type_name] = _parse_lli_field(
+                    oline[start + 14:start + 15], FILE, oln)
+            sig = SignalObs(prn=prn_id, values=values, lli=lli)
+            obs.signals[prn_id] = sig
+            if "C1C" in values:
+                obs.pseudoranges[prn_id] = values["C1C"]
             i += 1
         epochs.append(obs)
         if len(epochs) > MAX_EPOCHS:

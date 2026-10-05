@@ -33,7 +33,8 @@ def test_position_accuracy(solved):
     true = np.array([-2248562.1597, 5050353.2992, 3170398.7354])
     for r in solved:
         assert r.status == "ok", r.reason
-        assert np.linalg.norm(np.array(r.ecef_m) - true) < 2.0
+        # C1C now carries a synthetic ionosphere delay -> few-meter level
+        assert np.linalg.norm(np.array(r.ecef_m) - true) < 6.0
         assert abs(r.receiver_clock_s - 1.5e-4) < 1e-6
         assert r.rms_m < 2.0
         assert len(r.used_satellites) == 8
@@ -43,7 +44,7 @@ def test_geodetic(solved):
     lat, lon, h = (solved[0].geodetic[k] for k in ("lat_deg", "lon_deg", "height_m"))
     assert abs(lat - 30.0) < 1e-4
     assert abs(lon - 114.0) < 1e-4
-    assert abs(h - 50.0) < 2.0
+    assert abs(h - 50.0) < 6.0
 
 
 def test_ecef_to_geodetic_roundtrip():
